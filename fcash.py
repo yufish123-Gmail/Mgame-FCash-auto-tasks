@@ -25,11 +25,28 @@ MAIN = MEITUAN + "/com.meituan.android.pt.homepage.activity.MainActivity"
 MAIN_COMPONENT = tuple(MAIN.split("/", 1))
 WEB = "com.meituan.android.knb.core.StandardKnbActivity"
 TITANS_WEB = "com.sankuai.titans.adapter.mtapp.KNBWebViewActivity"
+MRN = "com.meituan.android.mrn.container.MRNBaseActivity"
+MRN_STANDARD = "com.meituan.android.mrn.container.MRNStandardActivity"
+MRNX = "com.meituan.android.mrnx.container.MRNXStandardActivity"
+TRAVEL_DETAIL = "com.meituan.traveltools.mrncontainer.HTMRNBaseActivity"
 DEAL_DETAIL = "com.meituan.android.generalcategories.dealdetail.GCDealDetailActivity"
 SUBGAME = GAME + "1"
 FULL_AD = MEITUAN + ".msv.page.activity.MSVPageActivity"
 AD_WEB = "com.ubix.ssp.open.comm.UBiXWebViewActivity"
 AD_SHOP = "com.qq.e.ads.ADActivity"
+CLOUD_HANDOFF = ("com.miui.cloudservice", "com.miui.cloudservice.wxapi.WXEntryActivity")
+DOUYIN_HANDOFF = ("com.ss.android.ugc.aweme", "com.ss.android.ugc.aweme.app.DeepLinkHandlerActivity")
+APP_LOCK = ("com.miui.securitycenter", "com.miui.applicationlock.ConfirmAccessControl")
+AD_LANDING_COMPONENTS = {
+    ("com.taobao.idlefish", "com.taobao.fleamarket.home.activity.InitActivity"),
+    ("com.taobao.idlefish", "com.taobao.idlefish.custom.FishUserLoginActivity"),
+    ("com.ss.android.article.lite", "com.ss.android.article.base.feature.app.schema.AdsAppActivity"),
+    ("com.ss.android.article.lite", "com.ss.android.ugc.detail.activity.TikTokActivity"),
+    ("com.quark.browser", "com.ucpro.MainActivity"),
+    ("com.quark.browser", "com.ucpro.BrowserActivity"),
+    ("com.miui.video", "com.miui.video.app.IntentActivity"),
+    ("com.miui.video", "com.miui.video.feature.home.VideoFlowPlayLetActivity"),
+}
 # These apps were already verified as ad destinations in the local Meituan setup.
 AD_APPS = {
     "com.eg.android.AlipayGphone", "com.tencent.mm",
@@ -67,6 +84,10 @@ class Stop(RuntimeError):
 
 class DifferentTotal(Stop):
     pass
+
+
+def is_ad_landing(component):
+    return component[0] in AD_APPS or component in AD_LANDING_COMPONENTS
 
 
 def command(*args, timeout=20):
@@ -292,17 +313,19 @@ class Runner:
                     open_attempts = 0
                     deadline = time.monotonic() + 20
                     continue
-                if self.match(image, "reward", (220, 390, 860, 620)):
+                # During the entrance animation the title can be dim while the buttons are readable.
+                if self.match(image, "reward", (220, 390, 860, 620), 0.84):
                     later = self.match(image, "later", (90, 1570, 490, 1800), 0.81)
                     final = self.match(image, "final", (350, 1570, 730, 1800))
                     if not (later or final):
                         time.sleep(0.45)
                         continue
-                    self.evidence("final-reward" if final else "reward", image)
-                    self.phone.tap(later or final)
-                    if final:
+                    is_final = later is None and final is not None
+                    self.evidence("final-reward" if is_final else "reward", image)
+                    self.phone.tap(later or final, activity=GAME)
+                    if is_final:
                         self.final_rewards += 1
-                    self.log("reward_dismissed", final=bool(final))
+                    self.log("reward_dismissed", final=is_final)
                 elif self.match(image, "offline", (272, 385, 815, 565)):
                     close = self.match(image, "offline_close", (303, 1800, 772, 1969))
                     if not close:
@@ -366,7 +389,7 @@ class Runner:
         for down in (False, True):
             still = 0
             direction = "down" if down else "up"
-            for step in range(1, 37):
+            for step in range(37):
                 row = self.row(image, task)
                 if row:
                     time.sleep(0.8)
@@ -382,6 +405,8 @@ class Runner:
                                 stable = self.row(image, task, top=stable[0][1] + 68)
                     else:
                         continue
+                if still >= 2 or step == 36:
+                    break
                 old = crop(image, LIST)
                 self.phone.scroll(down)
                 image = self.panel()
@@ -389,10 +414,8 @@ class Runner:
                 current = crop(image, LIST)
                 difference = cv2.norm(old, current, cv2.NORM_L1) / current.size
                 still = still + 1 if difference < 1.55 else 0
-                self.log("task_scan_scroll", direction=direction, step=step, difference=round(difference, 2),
+                self.log("task_scan_scroll", direction=direction, step=step + 1, difference=round(difference, 2),
                          stable_scrolls=still)
-                if still >= 2:
-                    break
         self.evidence("task-scan-end", image)
         return image, None
 
@@ -417,11 +440,11 @@ class Runner:
             value = re.sub(r"\s+", "", raw).replace("／", "/")
             if task.total is None:
                 # The row title is already verified visually. Read only its trailing count.
-                match = re.search(r"(\d{1,2})次[)）]?$", value)
+                match = re.search(r"(?<!\d)(\d{1,2})次[)）]?$", value)
                 if match and int(match[1]) <= 30:
                     return int(match[1])
             else:
-                match = re.search(r"(\d{1,2})/(\d{1,2})(?!\d)", value)
+                match = re.search(r"(?<!\d)(\d{1,2})/(\d{1,2})(?!\d)", value)
                 if match:
                     done, total = map(int, match.groups())
                     if total == task.total and done <= total:
@@ -482,13 +505,15 @@ class Runner:
                     return self.browse_internal(activity, 10 if task.key == "promo" else 5)
                 if task.key == "promo" and activity == WEB:
                     return self.browse_internal(activity, 10)
-                if (task.key == "promo" and activity == "com.meituan.android.mrn.container.MRNBaseActivity"
-                    and self.match(image, "merchant", (555, 2210, 820, 2330))):
+                if task.key == "promo" and (
+                    (activity == MRN and self.match(image, "merchant", (555, 2210, 820, 2330)))
+                    or (activity == TRAVEL_DETAIL and self.match(image, "travel_detail_tabs", (18, 1440, 840, 1810)))
+                ):
                     return self.browse_internal(activity, 10)
-                if (task.key == "goods" and activity == "com.meituan.android.mrn.container.MRNBaseActivity"
+                if (task.key == "goods" and activity == MRN
                     and self.match(image, "goods_landing", (191, 115, 902, 278))):
                     return self.browse_internal(activity, 5)
-                if (task.key == "goods" and activity == "com.meituan.android.mrn.container.MRNBaseActivity"
+                if (task.key == "goods" and activity == MRN
                     and self.match(image, "goods_refund", (170, 110, 902, 260), 0.88)):
                     time.sleep(7)
                     if self.component() == (MEITUAN, activity):
@@ -522,10 +547,54 @@ class Runner:
         raise Stop(f"「{task.name}」未识别到广告按钮或已验证的落地页。", code="task_open_unrecognized")
 
     def goods_card_button(self, image):
-        if (self.match(image, "goods_card", (108, 1190, 485, 1350))
-            or self.match(image, "goods_card_close", (878, 585, 1007, 712), 0.88)):
-            return self.match(image, "goods_card_button", (359, 1520, 768, 1712))
+        layouts = (
+            ((108, 1190, 485, 1350), (878, 585, 1007, 712), (359, 1520, 768, 1712)),
+            ((100, 1285, 510, 1450), (879, 477, 1008, 601), (358, 1660, 776, 1818)),
+        )
+        for title, close, button in layouts:
+            if self.match(image, "goods_card", title) or self.match(image, "goods_card_close", close, 0.88):
+                if result := self.match(image, "goods_card_button", button):
+                    return result
         return None
+
+    def goods_card_landing_status(self, activity):
+        if activity in {WEB, TITANS_WEB, DEAL_DETAIL, MRN}:
+            return "ready"
+        if activity == MRNX:
+            image = self.phone.frame()
+            if self.match(image, "goods_deal_unavailable", (320, 1150, 760, 1450), 0.93):
+                return "unavailable"
+            if (self.match(image, "goods_deal_details", (18, 850, 320, 1800), 0.90)
+                and self.match(image, "goods_deal_cart", (355, 2188, 681, 2335), 0.90)):
+                return "ready"
+        if activity == MRN_STANDARD:
+            image = self.phone.frame()
+            if (self.match(image, "goods_store_tabs", (18, 1150, 760, 2050), 0.90)
+                and (self.match(image, "goods_store_order", (362, 1730, 720, 2180), 0.90)
+                     or self.match(image, "goods_store_directions", (15, 1020, 285, 1340), 0.91))):
+                return "ready"
+        return None
+
+    def finish_goods_card_landing(self, activity, status):
+        if status == "unavailable":
+            self.blocked = True
+            self.evidence("goods-deal-unavailable")
+            self.log("goods_deal_unavailable", activity=activity)
+        else:
+            self.log("goods_card_landing", activity=activity, seconds=7)
+            time.sleep(7)
+        if self.component() == (MEITUAN, activity):
+            self.phone.back()
+            time.sleep(1.2)
+        if self.component() == (MEITUAN, GAME):
+            current = self.phone.frame()
+            if self.goods_card_button(current):
+                close = (self.match(current, "goods_card_close", (878, 585, 1007, 712))
+                         or self.match(current, "goods_card_close", (879, 477, 1008, 601)))
+                if not close:
+                    raise Stop("未确认浏览卡片关闭按钮。")
+                self.phone.tap(close, activity=GAME)
+        return self.panel()
 
     def browse_goods_card(self, image):
         self.stage("goods_card")
@@ -533,35 +602,25 @@ class Runner:
         if not button:
             raise Stop("未确认惊喜特价卡片的「浏览5s领奖励」。")
         time.sleep(0.7)
+        if self.component() != (MEITUAN, GAME):
+            raise Stop("惊喜特价卡片在点击前已离开游戏。")
         button = self.goods_card_button(self.phone.frame())
         if not button:
             raise Stop("惊喜特价卡片在点击前已变化。")
-        self.phone.tap(button)
+        self.phone.tap(button, activity=GAME)
         deadline = time.monotonic() + 20
         retry_at = time.monotonic() + 4
         retries = 0
         while time.monotonic() < deadline:
             package, activity = self.component()
-            if package == MEITUAN and activity in {WEB, TITANS_WEB, DEAL_DETAIL, "com.meituan.android.mrn.container.MRNBaseActivity"}:
-                self.log("goods_card_landing", activity=activity, seconds=7)
-                time.sleep(7)
-                if self.component() == (MEITUAN, activity):
-                    self.phone.back()
-                    time.sleep(1.2)
-                if self.component() == (MEITUAN, GAME):
-                    current = self.phone.frame()
-                    if self.goods_card_button(current):
-                        close = self.match(current, "goods_card_close", (878, 585, 1007, 712))
-                        if not close:
-                            raise Stop("未确认浏览卡片关闭按钮。")
-                        self.phone.tap(close)
-                return self.panel()
-            if package in AD_APPS:
+            if package == MEITUAN and (status := self.goods_card_landing_status(activity)):
+                return self.finish_goods_card_landing(activity, status)
+            if is_ad_landing((package, activity)):
                 return self.browse_landing(5)
             if (package, activity) == (MEITUAN, GAME) and retries < 2 and time.monotonic() >= retry_at:
                 button = self.goods_card_button(self.phone.frame())
                 if button:
-                    self.phone.tap(button)
+                    self.phone.tap(button, activity=GAME)
                     retries += 1
                     retry_at = time.monotonic() + 4
                     self.log("goods_card_retry", attempt=retries)
@@ -571,6 +630,7 @@ class Runner:
     def full_ad(self):
         self.stage("full_ad")
         deadline = time.monotonic() + 50
+        button_missing_since = None
         while time.monotonic() < deadline:
             if self.component() != (MEITUAN, FULL_AD):
                 break
@@ -579,7 +639,9 @@ class Runner:
             if self.close_download_modal(image):
                 time.sleep(0.7)
                 image = self.phone.frame()
-            if self.match(image, "full_done", (95, 156, 485, 254), 0.81):
+            if self.full_ad_done(image):
+                if self.phone.component() != (MEITUAN, FULL_AD):
+                    break
                 self.log("full_ad_confirmed")
                 self.phone.back()
                 time.sleep(1.3)
@@ -595,7 +657,7 @@ class Runner:
             if instruction and self.match(image, "full_banner", (111, 1710, 974, 1850), 0.85):
                 footer = self.match(image, "full_footer_open", (419, 2125, 671, 2245), 0.88)
                 if footer:
-                    self.phone.tap(footer)
+                    self.phone.tap(footer, activity=FULL_AD)
                     return self.browse_landing(10, from_full=True)
             if replay and instruction:
                 replay_top = replay[1]
@@ -611,11 +673,24 @@ class Runner:
                         if title in {"立即点击", "立即打开", "立即体验", "查看详情"}:
                             button = region
                 if not button:
+                    now = time.monotonic()
+                    if button_missing_since is None:
+                        button_missing_since = now
+                        self.log("full_ad_wait_for_button")
+                    if now - button_missing_since < 5 and now < deadline:
+                        time.sleep(0.5)
+                        continue
                     raise Stop("全屏广告要求打开落地页，但未确认入口按钮。", code="full_ad_button_unrecognized")
-                self.phone.tap(button)
+                self.phone.tap(button, activity=FULL_AD)
                 return self.browse_landing(10, from_full=True)
+            button_missing_since = None
             time.sleep(0.8)
         raise Stop("未确认全屏广告已播放结束。", code="full_ad_unconfirmed")
+
+    def full_ad_done(self, image):
+        region = (95, 156, 485, 254)
+        return bool(self.match(image, "full_done", region, 0.81)
+                    or self.match(image, "full_done_dim", region, 0.92))
 
     def close_download_modal(self, image):
         if not self.match(image, "download_modal", (377, 1355, 706, 1525), 0.90):
@@ -625,7 +700,7 @@ class Runner:
             self.remember("download-dialog", image)
             raise Stop("出现下载浮层，但未确认关闭按钮。", code="download_close_unrecognized")
         self.evidence("download-dialog", image)
-        self.phone.tap(close)
+        self.phone.tap(close, activity=FULL_AD)
         self.log("download_modal_closed")
         return True
 
@@ -686,51 +761,69 @@ class Runner:
 
     def browse_landing(self, seconds, *, from_full=False):
         self.stage("open_landing")
-        deadline = time.monotonic() + 12
+        started = time.monotonic()
+        deadline = started + 12
         while time.monotonic() < deadline:
             package, activity = self.component()
-            if from_full and (package, activity) == (MEITUAN, FULL_AD):
+            # The full-ad activity can remain visible while its landing starts.
+            if (from_full and (package, activity) == (MEITUAN, FULL_AD)
+                and time.monotonic() - started >= 2):
                 image = self.phone.frame()
-                if self.close_download_modal(image) or self.match(image, "full_done", (95, 156, 485, 254), 0.81):
+                if self.close_download_modal(image) or self.full_ad_done(image):
                     return self.finish_ad_return(True)
             if not from_full and (package, activity) == (MEITUAN, FULL_AD):
                 return self.full_ad()
-            if (package, activity) == (MEITUAN, WEB):
+            if not from_full and (package, activity) == (MEITUAN, WEB):
                 return self.browse_internal(activity, seconds)
-            if package == MEITUAN and activity in {AD_WEB, AD_SHOP}:
+            if package == MEITUAN and activity in {WEB, TITANS_WEB, AD_WEB, AD_SHOP}:
                 time.sleep(seconds + 2)
                 return self.finish_ad_return(from_full)
-            if (package, activity) == ("com.miui.securitycenter", "com.miui.applicationlock.ConfirmAccessControl"):
-                self.log("app_lock_return")
-                self.blocked = True
-                self.phone.return_to_game()
-                time.sleep(1.3)
-                if self.component()[0] == MEITUAN:
-                    image = self.phone.frame()
-                    if self.ad_button(image):
-                        close = self.match(image, "ad_close", (479, 1680, 603, 1905), 0.85)
-                        if close:
-                            self.phone.tap(close)
-                return self.panel()
-            if package in AD_APPS:
+            if (package, activity) == APP_LOCK:
+                return self.return_from_app_lock(seconds, from_full=from_full)
+            if is_ad_landing((package, activity)):
                 self.log("landing", package=package, activity=activity)
                 time.sleep(seconds + 2)
                 current = self.component()
                 deadline = time.monotonic() + 5
-                while current[0] is None and time.monotonic() < deadline:
+                while (current[0] is None or (from_full and current == CLOUD_HANDOFF)) and time.monotonic() < deadline:
                     time.sleep(0.5)
                     current = self.component()
                 if current[0] == MEITUAN:
                     return self.finish_ad_return(from_full)
-                if current[0] not in AD_APPS:
+                if not is_ad_landing(current):
                     raise Stop("广告停留期间页面发生切换。", code="landing_changed")
                 self.phone.return_to_game()
                 time.sleep(1.3)
                 return self.finish_ad_return(from_full)
-            if package not in (None, MEITUAN):
+            # These transitions do not start the dwell timer.
+            handoff = (package, activity) == DOUYIN_HANDOFF or (from_full and (package, activity) == CLOUD_HANDOFF)
+            if package not in (None, MEITUAN) and not handoff:
                 raise Stop(f"广告跳转到尚未验证的应用 {package}。", code="landing_app_unrecognized")
             time.sleep(0.5)
         raise Stop("广告打开后未识别落地页，尚未确认浏览计时。", code="landing_unrecognized")
+
+    def return_from_app_lock(self, seconds=0, *, from_full=False):
+        self.log("app_lock_return")
+        self.blocked = True
+        self.phone.return_to_game()
+        time.sleep(1.3)
+        package, activity = self.component()
+        if is_ad_landing((package, activity)):
+            self.log("app_lock_landing", package=package, activity=activity)
+            if seconds:
+                time.sleep(seconds + 2)
+            package, activity = self.component()
+            if is_ad_landing((package, activity)):
+                self.phone.return_to_game()
+                time.sleep(1.3)
+                package, activity = self.component()
+        if package == MEITUAN:
+            image = self.phone.frame()
+            if self.ad_button(image):
+                close = self.match(image, "ad_close", (479, 1680, 603, 1905), 0.85)
+                if close:
+                    self.phone.tap(close, activity=activity)
+        return self.finish_ad_return(from_full)
 
     def finish_ad_return(self, from_full):
         self.stage("return_to_game")
@@ -747,7 +840,7 @@ class Runner:
             close = self.match(self.phone.frame(), "ad_web_close", (145, 112, 265, 229), 0.89)
             if close is None:
                 raise Stop("未确认广告网页顶部的关闭按钮。")
-            self.phone.tap(close)
+            self.phone.tap(close, activity=AD_WEB)
             self.log("ad_web_closed")
             time.sleep(1.3)
         if self.component() == (MEITUAN, AD_SHOP):
@@ -755,21 +848,46 @@ class Runner:
             close = self.match(image, "ad_shop_close", (960, 109, 1067, 228))
             if not close:
                 raise Stop("未确认原生广告页的关闭按钮。")
-            self.phone.tap(close)
+            self.phone.tap(close, activity=AD_SHOP)
             self.log("ad_shop_closed")
             time.sleep(1.3)
-        if self.component()[0] in AD_APPS:
+        if is_ad_landing(self.component()):
             self.log("landing_redirected_again")
             self.phone.return_to_game()
             time.sleep(1.5)
             if self.component() in {(MEITUAN, AD_WEB), (MEITUAN, AD_SHOP)}:
                 self.phone.back()
                 time.sleep(1.3)
-        if from_full and self.component() == (MEITUAN, FULL_AD):
-            if not self.match(self.phone.frame(), "full_done", (95, 156, 485, 254), 0.81):
-                raise Stop("广告落地页返回后未显示「已完成，返回领奖励」。")
-            self.phone.back()
-            time.sleep(1.3)
+        component = self.component()
+        if component in {(MEITUAN, WEB), (MEITUAN, TITANS_WEB)}:
+            for _ in range(2):
+                if self.phone.component() != component:
+                    break
+                self.phone.back()
+                self.log("ad_web_back", activity=component[1])
+                time.sleep(1.3)
+        if self.component() == (MEITUAN, MRN_STANDARD):
+            image = self.phone.frame()
+            if self.ad_button(image):
+                close = self.match(image, "ad_close", (479, 1680, 603, 1905), 0.85)
+                if close:
+                    self.phone.tap(close, activity=MRN_STANDARD)
+                    self.blocked = True
+                    self.log("residual_ad_closed")
+                    time.sleep(1.3)
+        if from_full:
+            deadline = time.monotonic() + 8
+            while self.component() == (MEITUAN, FULL_AD):
+                image = self.phone.frame()
+                self.remember("last-full-ad-check", image)
+                if self.full_ad_done(image) and self.phone.component() == (MEITUAN, FULL_AD):
+                    self.phone.back()
+                    self.log("full_ad_confirmed")
+                    time.sleep(1.3)
+                    break
+                if time.monotonic() >= deadline:
+                    raise Stop("广告落地页返回后未显示「已完成，返回领奖励」。", code="full_ad_return_unconfirmed")
+                time.sleep(0.5)
         return self.panel()
 
     def browse_internal(self, activity, seconds):
@@ -791,8 +909,6 @@ class Runner:
         while True:
             self.remember("last-settlement-check", image)
             row = self.row(image, task)
-            if left == 1 and self.final_rewards > final_before:
-                return image, row, 0
             if row:
                 if not claimed:
                     reward_result = self.collect_ready(image, task, row)
@@ -803,21 +919,19 @@ class Runner:
                 try:
                     after = self.remaining(image, task, row[0])
                 except DifferentTotal:
-                    image, row = self.find(task, image)
-                    if row is None:
-                        raise Stop(f"结算时只找到不同总次数的同名任务「{task.name}」。",
-                                   code="settlement_target_missing") from None
-                    return image, row, self.remaining(image, task, row[0])
-                if after != left:
+                    row = None
+                    deadline = time.monotonic()
+                if row and after != left:
                     return image, row, after
-            if time.monotonic() >= deadline:
+            final_seen = left == 1 and self.final_rewards > final_before
+            if time.monotonic() >= deadline or (not row and final_seen):
                 if row:
                     return image, row, after
                 image, row = self.find(task, image)
-                if left == 1 and self.final_rewards > final_before:
-                    return image, row, 0
                 if row:
                     return image, row, self.remaining(image, task, row[0])
+                if left == 1 and self.final_rewards > final_before:
+                    return image, None, 0
                 raise Stop(f"浏览后未找到「{task.name}」，无法核对结算。", code="settlement_target_missing")
             time.sleep(0.55)
             image = self.panel()
@@ -847,7 +961,7 @@ class Runner:
                 image = self.panel()
         return image
 
-    def finish(self, task, limit):
+    def finish(self, task, limit, *, resume_final_before=None):
         self.task_key = task.key
         self.last_remaining = None
         self.round_info = None
@@ -855,6 +969,11 @@ class Runner:
         self.stage("locate_task")
         image, row = self.find(task, self.panel())
         if row is None:
+            if resume_final_before is not None and self.final_rewards > resume_final_before:
+                self.last_remaining = 0
+                self.log("task_finished", task=task.key, remaining=0)
+                print(f"{task.name}：最终奖励已结算。", flush=True)
+                return
             self.log("task_not_listed", task=task.key)
             print(f"当前列表未显示「{task.name}」，跳过。", flush=True)
             return
@@ -880,16 +999,17 @@ class Runner:
             self.recent_frames.clear()
             self.round_info = {"remaining_before": left, "attempt": retries + 1}
             self.stage("prepare_task_tap")
-            if row[1] is None:
-                raise Stop(f"「{task.name}」仍有剩余，但未看到「去完成」。", code="task_go_missing")
             current = self.panel()
             fresh = self.row(current, task, top=max(LIST[1], row[0][1] - 8))
             if fresh is None or abs(fresh[0][1] - row[0][1]) > 8:
                 current, fresh = self.find(task, current)
-            if not fresh or fresh[1] is None:
+            if fresh and fresh[1] is None:
+                raise Stop(f"「{task.name}」仍有剩余，但未看到「去完成」。", code="task_go_missing")
+            if not fresh:
                 raise Stop("点击前任务行已变化。", code="task_changed_before_tap")
-            if abs(fresh[1][1] - row[1][1]) > 12 and self.remaining(current, task, fresh[0]) != left:
-                raise Stop("点击前移动后的任务进度已变化。", code="progress_changed_before_tap")
+            if row[1] is None or abs(fresh[1][1] - row[1][1]) > 12:
+                if self.remaining(current, task, fresh[0]) != left:
+                    raise Stop("点击前任务进度已变化。", code="progress_changed_before_tap")
             for _ in range(5):
                 time.sleep(0.6)
                 stable = self.phone.frame()
@@ -963,16 +1083,25 @@ def main():
             runner.phone = Phone(args.serial)
             runner.log("device_connected")
             tasks = [task for task in TASKS if args.task in {"all", task.key}]
+            resume_final_before = (
+                runner.final_rewards if args.task != "all" and (args.resume_ad or args.recover_landing) else None
+            )
             if args.recover_landing:
                 runner.stage("recover_landing")
                 component = runner.component()
-                if component[0] in AD_APPS:
-                    runner.phone.return_to_game()
-                    time.sleep(1.5)
-                elif component in {(MEITUAN, WEB), (MEITUAN, TITANS_WEB), (MEITUAN, DEAL_DETAIL)}:
-                    runner.phone.back()
-                    time.sleep(1.3)
-                runner.finish_ad_return(True)
+                if component == APP_LOCK:
+                    runner.return_from_app_lock()
+                elif (args.task == "goods" and component[0] == MEITUAN and component[1] in {MRNX, MRN_STANDARD}
+                      and (status := runner.goods_card_landing_status(component[1]))):
+                    runner.finish_goods_card_landing(component[1], status)
+                else:
+                    if is_ad_landing(component):
+                        runner.phone.return_to_game()
+                        time.sleep(1.5)
+                    elif component in {(MEITUAN, WEB), (MEITUAN, TITANS_WEB), (MEITUAN, DEAL_DETAIL)}:
+                        runner.phone.back()
+                        time.sleep(1.3)
+                    runner.finish_ad_return(True)
             if args.resume_ad:
                 runner.stage("resume_ad")
                 frame = runner.phone.frame()
@@ -990,7 +1119,7 @@ def main():
                 runner.log("run_finished", status="preview")
                 return 0
             for task in tasks:
-                runner.finish(task, args.limit)
+                runner.finish(task, args.limit, resume_final_before=resume_final_before)
             runner.log("run_finished", status="finished")
         return 0
     except KeyboardInterrupt as exc:
