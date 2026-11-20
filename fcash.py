@@ -46,6 +46,8 @@ AD_LANDING_COMPONENTS = {
     ("com.quark.browser", "com.ucpro.BrowserActivity"),
     ("com.miui.video", "com.miui.video.app.IntentActivity"),
     ("com.miui.video", "com.miui.video.feature.home.VideoFlowPlayLetActivity"),
+    ("com.kmxs.reader", "com.km.app.home.view.LoadingActivity"),
+    ("com.kmxs.reader", "com.km.app.update.UpdateVersionV2Activity"),
 }
 # These apps were already verified as ad destinations in the local Meituan setup.
 AD_APPS = {
@@ -107,6 +109,12 @@ def center(box):
     return (x1 + x2) // 2, (y1 + y2) // 2
 
 
+def panel_header_visible(image):
+    # The title template also matches through a modal fade.
+    header = crop(image, (360, 701, 720, 724))
+    return np.median(header[:, :, 2]) >= 180
+
+
 def save(path, image):
     encoded, data = cv2.imencode(".png", image)
     if not encoded:
@@ -162,16 +170,20 @@ class Phone:
         return package, package + activity if activity.startswith(".") else activity
 
     def frame(self, *, allow_landscape=False, diagnostic=False, timeout=20):
-        data = self.call("exec-out", "screencap", "-p", timeout=timeout)
+        sizes = {(2400, 1080), (1080, 2400)} if allow_landscape else {(2400, 1080)}
+        attempts = 1 if diagnostic else 2
+        for attempt in range(attempts):
+            data = self.call("exec-out", "screencap", "-p", timeout=timeout)
+            image = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR) if data else None
+            if image is not None:
+                if not diagnostic and image.shape[:2] not in sizes:
+                    raise Stop("请保持手机 1080×2400 竖屏。", code="screenshot_size_mismatch")
+                return image
+            if attempt + 1 < attempts:
+                time.sleep(0.3)
         if not data:
             raise Stop("手机截图不可用，请确认已解锁。", code="screenshot_empty")
-        image = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
-        sizes = {(2400, 1080), (1080, 2400)} if allow_landscape else {(2400, 1080)}
-        if image is None:
-            raise Stop("手机截图无法解码。", code="screenshot_decode_failed")
-        if not diagnostic and image.shape[:2] not in sizes:
-            raise Stop("请保持手机 1080×2400 竖屏。", code="screenshot_size_mismatch")
-        return image
+        raise Stop("手机截图无法解码。", code="screenshot_decode_failed")
 
     def tap(self, box, *, activity=None):
         package, foreground = self.component()
@@ -332,13 +344,14 @@ class Runner:
                         raise Stop("离线收益浮层遮住任务入口，未识别跳过按钮。")
                     self.phone.tap(close)
                 elif self.match(image, "panel", (365, 685, 716, 834)):
-                    return image
+                    if panel_header_visible(image):
+                        return image
                 elif open_attempts < 3 and time.monotonic() >= next_open:
                     entry = self.match(image, "task_entry", (750, 2060, 905, 2260), 0.86)
                     if entry:
                         x = center(entry)[0]
                         y = entry[1] - 34
-                        self.phone.tap((x, y, x, y))
+                        self.phone.tap((x, y, x, y), activity=GAME)
                         self.log("task_panel_tap", point=(x, y))
                         open_attempts += 1
                         next_open = time.monotonic() + 4
@@ -350,7 +363,7 @@ class Runner:
             close = self.match(image, "panel_close", (950, 676, 1060, 800))
             if not close:
                 raise Stop("放置区已满，但每日任务面板关闭按钮未确认。")
-            self.phone.tap(close)
+            self.phone.tap(close, activity=GAME)
             time.sleep(0.7)
         print("放置区已满，按 5.5 秒间隔执行 10 次一键合成。", flush=True)
         for step in range(10):
@@ -361,13 +374,15 @@ class Runner:
             button = self.match(image, "merge", (915, 1680, 1062, 1850), 0.85)
             if not (entry and button):
                 raise Stop("未确认游戏首页的「一键合成」按钮。")
-            self.phone.tap(button)
+            self.phone.tap(button, activity=GAME)
             self.log("capacity_merge", step=step + 1)
             time.sleep(5.5)
         self.capacity_recoveries += 1
         self.evidence("capacity-after")
 
     def row(self, image, task, *, top=LIST[1]):
+        if not panel_header_visible(image):
+            return None
         while top < 2340:
             title = self.match(image, task.title, (227, top, 610, 2345), first=True)
             if not title:
@@ -503,12 +518,7 @@ class Runner:
                     return self.full_ad()
                 if activity == TITANS_WEB:
                     return self.browse_internal(activity, 10 if task.key == "promo" else 5)
-                if task.key == "promo" and activity == WEB:
-                    return self.browse_internal(activity, 10)
-                if task.key == "promo" and (
-                    (activity == MRN and self.match(image, "merchant", (555, 2210, 820, 2330)))
-                    or (activity == TRAVEL_DETAIL and self.match(image, "travel_detail_tabs", (18, 1440, 840, 1810)))
-                ):
+                if task.key == "promo" and self.is_promo_landing(activity, image):
                     return self.browse_internal(activity, 10)
                 if (task.key == "goods" and activity == MRN
                     and self.match(image, "goods_landing", (191, 115, 902, 278))):
@@ -531,10 +541,11 @@ class Runner:
             image = self.phone.frame()
             self.remember("task-open-timeout", image)
             if self.match(image, "panel", (365, 685, 716, 834)):
+                final_before_rescan = self.final_rewards
+                image = self.panel()
                 self.evidence("panel-after-task-tap", image)
                 self.stage("rescan_after_tap")
                 self.log("task_panel_rescan", target_visible=bool(self.row(image, task)))
-                final_before_rescan = self.final_rewards
                 image, row = self.find(task, image)
                 if row is None:
                     if self.final_rewards > final_before_rescan:
@@ -545,6 +556,14 @@ class Runner:
                 self.log("task_still_on_panel", title_box=row[0], go_visible=bool(row[1]))
                 return image
         raise Stop(f"「{task.name}」未识别到广告按钮或已验证的落地页。", code="task_open_unrecognized")
+
+    def is_promo_landing(self, activity, image):
+        if activity == MRN:
+            return bool(self.match(image, "merchant", (555, 2210, 820, 2330))
+                        or self.match(image, "promo_special_group", (68, 94, 304, 208)))
+        if activity == TRAVEL_DETAIL:
+            return bool(self.match(image, "travel_detail_tabs", (18, 1440, 840, 1810)))
+        return activity == WEB
 
     def goods_card_button(self, image):
         layouts = (
@@ -572,6 +591,9 @@ class Runner:
             if (self.match(image, "goods_store_tabs", (18, 1150, 760, 2050), 0.90)
                 and (self.match(image, "goods_store_order", (362, 1730, 720, 2180), 0.90)
                      or self.match(image, "goods_store_directions", (15, 1020, 285, 1340), 0.91))):
+                return "ready"
+            if (self.match(image, "goods_store_recommendations", (335, 700, 810, 1070), 0.92)
+                and self.match(image, "goods_store_menu", (25, 980, 320, 1370), 0.92)):
                 return "ready"
         return None
 
@@ -921,6 +943,12 @@ class Runner:
                 except DifferentTotal:
                     row = None
                     deadline = time.monotonic()
+                except Stop as exc:
+                    if exc.code != "progress_unreadable" or time.monotonic() >= deadline:
+                        raise
+                    time.sleep(0.55)
+                    image = self.panel()
+                    continue
                 if row and after != left:
                     return image, row, after
             final_seen = left == 1 and self.final_rewards > final_before
@@ -945,7 +973,7 @@ class Runner:
             return False
         self.remember("before-task-claim", image)
         self.log("task_claim_intent", point=center(button))
-        self.phone.tap(button)
+        self.phone.tap(button, activity=GAME)
         self.log("task_claim", task=task.key)
         time.sleep(1.4)
         return True
@@ -1091,6 +1119,9 @@ def main():
                 component = runner.component()
                 if component == APP_LOCK:
                     runner.return_from_app_lock()
+                elif (args.task == "promo" and component[0] == MEITUAN and component[1] in {MRN, TRAVEL_DETAIL}
+                      and runner.is_promo_landing(component[1], runner.phone.frame())):
+                    runner.browse_internal(component[1], 10)
                 elif (args.task == "goods" and component[0] == MEITUAN and component[1] in {MRNX, MRN_STANDARD}
                       and (status := runner.goods_card_landing_status(component[1]))):
                     runner.finish_goods_card_landing(component[1], status)
