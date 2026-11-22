@@ -9,8 +9,8 @@
 3. 用户要求真机回测时，先单项跑一轮，并从手机实际进度续跑。整体验证顺序为 `page → browse12 → promo → browse14 → goods`。
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\run.ps1 -Task goods -Limit 1 -Execute
-powershell -NoProfile -ExecutionPolicy Bypass -File .\run.ps1 -Execute
+.\.venv\Scripts\python.exe -X utf8 .\fcash.py --execute --task goods --limit 1
+.\.venv\Scripts\python.exe -X utf8 .\fcash.py --execute
 ```
 
 ## 改哪里、怎么验证
@@ -35,3 +35,10 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\run.ps1 -Execute
 - `Phone.frame` 对空数据或解码失败重取一次，ADB 明确返回设备不可用时退出。合成与领取前会再次确认游戏 Activity。若放置区合成时断线，先看 `capacity_merge`、`task_claim` 和 `stopped.last_remaining`，再确认 `adb devices -l` 显示 `device`。回到游戏后按中断任务续跑，由程序读取当前次数和待领奖状态。
 
 本次断线前，好物最后一次读到剩余 8 次。重连后重新识别为剩余 7 次，最终续跑到 0。当天五项共完成 56 轮，五项均记录 `task_finished` 与 `remaining=0`。
+
+## 2026-11-22 Python 执行与效率
+
+- 定位扫描耗时时看 `task_scan_scroll` 的次数与 `wide` 字段。长滑动后会检查截图内容的方向和重叠。记录 `task_scan_narrow_retry` 时，脚本从当前画面用原短滑动重新覆盖列表。完成后的结算核对仍扫过目标行可能出现的位置。
+- `progress_ocr_reused` 只复用同一任务、完全相同裁图的成功结果。`previous_ocr_ms` 是上次识别耗时，用于估算减少的 OCR 开销。需要比较总耗时，可分别统计广告等待、列表扫描和中断恢复。
+- 首页额外红包广告按标题和「放弃红包奖励」两个模板关闭。微信广告仅对已核实的网页与中转 Activity 使用返回键。好物卡片的关闭图标另有不含商品背景的局部模板。
+- 11 月 21 日前四项记录了 `remaining=0`。好物在第二批合成中断线。重连后回到游戏，用 `.\.venv\Scripts\python.exe -X utf8 .\fcash.py --execute --task goods` 重新读取当前次数和待领奖状态。

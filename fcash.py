@@ -34,6 +34,10 @@ SUBGAME = GAME + "1"
 FULL_AD = MEITUAN + ".msv.page.activity.MSVPageActivity"
 AD_WEB = "com.ubix.ssp.open.comm.UBiXWebViewActivity"
 AD_SHOP = "com.qq.e.ads.ADActivity"
+WECHAT_AD_WEB_VIEWS = {
+    ("com.tencent.mm", "com.tencent.mm.plugin.webview.ui.tools.CustomSchemeEntryMMWebViewUI"),
+    ("com.tencent.mm", "com.tencent.mm.plugin.webview.stub.WebViewStubProxyUI"),
+}
 CLOUD_HANDOFF = ("com.miui.cloudservice", "com.miui.cloudservice.wxapi.WXEntryActivity")
 DOUYIN_HANDOFF = ("com.ss.android.ugc.aweme", "com.ss.android.ugc.aweme.app.DeepLinkHandlerActivity")
 APP_LOCK = ("com.miui.securitycenter", "com.miui.applicationlock.ConfirmAccessControl")
@@ -115,6 +119,26 @@ def panel_header_visible(image):
     return np.median(header[:, :, 2]) >= 180
 
 
+def list_frames_overlap(before, after, down):
+    # Keep enough shared content to see a full row across the two viewports.
+    before = cv2.resize(before[:, 50:860], None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)
+    after = cv2.resize(after[:, 50:860], None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)
+    height = before.shape[0]
+    sample_height = 132
+    start = height - 55 - sample_height if down else 55
+    scores = cv2.matchTemplate(after, before[start:start + sample_height], cv2.TM_CCOEFF_NORMED)
+    _, score, _, (_, end) = cv2.minMaxLoc(scores)
+    shift = end - start
+    distance = -shift if down else shift
+    if score < 0.94 or not 0 <= distance <= 390:
+        return False
+    old_start, new_start = max(0, -shift), max(0, shift)
+    shared_height = height - abs(shift)
+    old_region = before[old_start:old_start + shared_height]
+    new_region = after[new_start:new_start + shared_height]
+    return cv2.norm(old_region, new_region, cv2.NORM_L1) / old_region.size < 8
+
+
 def save(path, image):
     encoded, data = cv2.imencode(".png", image)
     if not encoded:
@@ -191,10 +215,14 @@ class Phone:
             raise Stop(f"点击前页面已切换（{package}/{foreground}）。", code="foreground_changed_before_tap")
         self.call("shell", "input", "tap", *map(str, center(box)))
 
-    def scroll(self, down):
+    def scroll(self, down, *, wide=False):
         if self.component() != (MEITUAN, GAME):
             raise Stop("滚动前未确认游戏在前台。")
-        start, end = (2090, 1710) if down else (1630, 2010)
+        if wide:
+            top, bottom = 1510, 2190
+        else:
+            top, bottom = (1710, 2090) if down else (1630, 2010)
+        start, end = (bottom, top) if down else (top, bottom)
         self.call("shell", "input", "swipe", "475", str(start), "475", str(end), "900")
         time.sleep(1.0)
 
@@ -218,6 +246,7 @@ class Runner:
         self.phase = "startup"
         self.round_info = None
         self.last_remaining = None
+        self.progress_cache = None
         self.recent_frames = {}
         self.last_component = None
         self.last_heartbeat = time.monotonic()
@@ -343,6 +372,11 @@ class Runner:
                     if not close:
                         raise Stop("离线收益浮层遮住任务入口，未识别跳过按钮。")
                     self.phone.tap(close)
+                elif self.match(image, "home_bonus_double", (180, 565, 872, 815)):
+                    close = self.match(image, "home_bonus_skip", (345, 1790, 750, 1925))
+                    if close:
+                        self.phone.tap(close, activity=GAME)
+                        self.log("home_bonus_skipped")
                 elif self.match(image, "panel", (365, 685, 716, 834)):
                     if panel_header_visible(image):
                         return image
@@ -400,7 +434,7 @@ class Runner:
             return title, None
         return None
 
-    def find(self, task, image):
+    def find(self, task, image, *, wide=True):
         for down in (False, True):
             still = 0
             direction = "down" if down else "up"
@@ -423,14 +457,17 @@ class Runner:
                 if still >= 2 or step == 36:
                     break
                 old = crop(image, LIST)
-                self.phone.scroll(down)
+                self.phone.scroll(down, wide=wide)
                 image = self.panel()
                 self.remember(f"scan-{direction}", image)
                 current = crop(image, LIST)
                 difference = cv2.norm(old, current, cv2.NORM_L1) / current.size
                 still = still + 1 if difference < 1.55 else 0
                 self.log("task_scan_scroll", direction=direction, step=step + 1, difference=round(difference, 2),
-                         stable_scrolls=still)
+                         stable_scrolls=still, wide=wide)
+                if wide and still == 0 and not list_frames_overlap(old, current, down):
+                    self.log("task_scan_narrow_retry", direction=direction, step=step + 1)
+                    return self.find(task, image, wide=False)
         self.evidence("task-scan-end", image)
         return image, None
 
@@ -443,6 +480,12 @@ class Runner:
     def remaining(self, image, task, title):
         y = title[1]
         gray = cv2.cvtColor(crop(image, (225, y - 3, 782, y + 59)), cv2.COLOR_BGR2GRAY)
+        key = (task.key, task.total, gray.shape, gray.tobytes())
+        if self.progress_cache is not None and key == self.progress_cache[0]:
+            _, remaining, ocr_ms = self.progress_cache
+            self.log("progress_ocr_reused", remaining=remaining, previous_ocr_ms=ocr_ms)
+            return remaining
+        started = time.monotonic()
         _, binary = cv2.threshold(gray, 128, 255, cv2.THRESH_BINARY)
         other_total = None
         readings = {}
@@ -457,20 +500,27 @@ class Runner:
                 # The row title is already verified visually. Read only its trailing count.
                 match = re.search(r"(?<!\d)(\d{1,2})次[)）]?$", value)
                 if match and int(match[1]) <= 30:
-                    return int(match[1])
+                    remaining = int(match[1])
+                    break
             else:
                 match = re.search(r"(?<!\d)(\d{1,2})/(\d{1,2})(?!\d)", value)
                 if match:
                     done, total = map(int, match.groups())
                     if total == task.total and done <= total:
-                        return total - done
+                        remaining = total - done
+                        break
                     if 0 <= done <= total <= 30:
                         other_total = total
-        if other_total is not None and other_total != task.total:
-            raise DifferentTotal(f"同名任务总次数为 {other_total}，期望 {task.total}。")
-        self.remember("progress-unreadable", image)
-        self.log("progress_ocr_failed", title_box=title, readings=readings)
-        raise Stop(f"无法确认「{task.name}」进度，识别结果 {raw!r}。", code="progress_unreadable")
+        else:
+            if other_total is not None and other_total != task.total:
+                raise DifferentTotal(f"同名任务总次数为 {other_total}，期望 {task.total}。")
+            self.remember("progress-unreadable", image)
+            self.log("progress_ocr_failed", title_box=title, readings=readings)
+            raise Stop(f"无法确认「{task.name}」进度，识别结果 {raw!r}。", code="progress_unreadable")
+        ocr_ms = round((time.monotonic() - started) * 1000)
+        self.progress_cache = (key, remaining, ocr_ms)
+        self.log("progress_ocr_read", remaining=remaining, ocr_ms=ocr_ms)
+        return remaining
 
     def ad_button(self, image):
         if not self.match(image, "ad_close", (479, 1680, 603, 1905), 0.85):
@@ -571,10 +621,14 @@ class Runner:
             ((100, 1285, 510, 1450), (879, 477, 1008, 601), (358, 1660, 776, 1818)),
         )
         for title, close, button in layouts:
-            if self.match(image, "goods_card", title) or self.match(image, "goods_card_close", close, 0.88):
+            if self.match(image, "goods_card", title) or self.goods_card_close(image, close, 0.88):
                 if result := self.match(image, "goods_card_button", button):
                     return result
         return None
+
+    def goods_card_close(self, image, region, threshold=0.91):
+        return (self.match(image, "goods_card_close", region, threshold)
+                or self.match(image, "goods_card_close_icon", region, 0.94))
 
     def goods_card_landing_status(self, activity):
         if activity in {WEB, TITANS_WEB, DEAL_DETAIL, MRN}:
@@ -611,8 +665,8 @@ class Runner:
         if self.component() == (MEITUAN, GAME):
             current = self.phone.frame()
             if self.goods_card_button(current):
-                close = (self.match(current, "goods_card_close", (878, 585, 1007, 712))
-                         or self.match(current, "goods_card_close", (879, 477, 1008, 601)))
+                close = (self.goods_card_close(current, (878, 585, 1007, 712))
+                         or self.goods_card_close(current, (879, 477, 1008, 601)))
                 if not close:
                     raise Stop("未确认浏览卡片关闭按钮。")
                 self.phone.tap(close, activity=GAME)
@@ -850,6 +904,15 @@ class Runner:
     def finish_ad_return(self, from_full):
         self.stage("return_to_game")
         component = self.component()
+        if component in WECHAT_AD_WEB_VIEWS:
+            for _ in range(3):
+                if component not in WECHAT_AD_WEB_VIEWS:
+                    break
+                if self.phone.component() in WECHAT_AD_WEB_VIEWS:
+                    self.phone.back()
+                    self.log("wechat_ad_web_back", activity=component[1])
+                    time.sleep(1.3)
+                component = self.component()
         if component[0] == "com.xiaomi.market" and component[1] in {
             "com.xiaomi.market.ui.detail.AppDetailMiniCardActivity",
             "com.xiaomi.market.ui.detail.AppDetailCardActivity",
@@ -858,14 +921,16 @@ class Runner:
             time.sleep(0.6)
             self.phone.return_to_game()
             time.sleep(1.3)
-        if self.component() == (MEITUAN, AD_WEB):
+            component = self.component()
+        if component == (MEITUAN, AD_WEB):
             close = self.match(self.phone.frame(), "ad_web_close", (145, 112, 265, 229), 0.89)
             if close is None:
                 raise Stop("未确认广告网页顶部的关闭按钮。")
             self.phone.tap(close, activity=AD_WEB)
             self.log("ad_web_closed")
             time.sleep(1.3)
-        if self.component() == (MEITUAN, AD_SHOP):
+            component = self.component()
+        if component == (MEITUAN, AD_SHOP):
             image = self.phone.frame()
             close = self.match(image, "ad_shop_close", (960, 109, 1067, 228))
             if not close:
@@ -873,14 +938,16 @@ class Runner:
             self.phone.tap(close, activity=AD_SHOP)
             self.log("ad_shop_closed")
             time.sleep(1.3)
-        if is_ad_landing(self.component()):
+            component = self.component()
+        if is_ad_landing(component):
             self.log("landing_redirected_again")
             self.phone.return_to_game()
             time.sleep(1.5)
-            if self.component() in {(MEITUAN, AD_WEB), (MEITUAN, AD_SHOP)}:
+            component = self.component()
+            if component in {(MEITUAN, AD_WEB), (MEITUAN, AD_SHOP)}:
                 self.phone.back()
                 time.sleep(1.3)
-        component = self.component()
+                component = self.component()
         if component in {(MEITUAN, WEB), (MEITUAN, TITANS_WEB)}:
             for _ in range(2):
                 if self.phone.component() != component:
@@ -888,7 +955,8 @@ class Runner:
                 self.phone.back()
                 self.log("ad_web_back", activity=component[1])
                 time.sleep(1.3)
-        if self.component() == (MEITUAN, MRN_STANDARD):
+            component = self.component()
+        if component == (MEITUAN, MRN_STANDARD):
             image = self.phone.frame()
             if self.ad_button(image):
                 close = self.match(image, "ad_close", (479, 1680, 603, 1905), 0.85)
@@ -897,9 +965,10 @@ class Runner:
                     self.blocked = True
                     self.log("residual_ad_closed")
                     time.sleep(1.3)
+                    component = self.component()
         if from_full:
             deadline = time.monotonic() + 8
-            while self.component() == (MEITUAN, FULL_AD):
+            while component == (MEITUAN, FULL_AD):
                 image = self.phone.frame()
                 self.remember("last-full-ad-check", image)
                 if self.full_ad_done(image) and self.phone.component() == (MEITUAN, FULL_AD):
@@ -910,6 +979,7 @@ class Runner:
                 if time.monotonic() >= deadline:
                     raise Stop("广告落地页返回后未显示「已完成，返回领奖励」。", code="full_ad_return_unconfirmed")
                 time.sleep(0.5)
+                component = self.component()
         return self.panel()
 
     def browse_internal(self, activity, seconds):
@@ -1095,6 +1165,8 @@ def main():
     parser.add_argument("--resume-ad", action="store_true", help="继续当前已确认归属的全屏广告")
     parser.add_argument("--recover-landing", action="store_true", help="从本程序打开的已知广告落地页返回")
     args = parser.parse_args()
+    if not 0 <= args.limit <= 30:
+        parser.error("--limit must be between 0 and 30")
     if args.resume_ad and (not args.execute or args.task == "all"):
         parser.error("--resume-ad requires --execute and a specific --task")
     if args.recover_landing and (not args.execute or args.resume_ad):
@@ -1126,7 +1198,7 @@ def main():
                       and (status := runner.goods_card_landing_status(component[1]))):
                     runner.finish_goods_card_landing(component[1], status)
                 else:
-                    if is_ad_landing(component):
+                    if is_ad_landing(component) and component not in WECHAT_AD_WEB_VIEWS:
                         runner.phone.return_to_game()
                         time.sleep(1.5)
                     elif component in {(MEITUAN, WEB), (MEITUAN, TITANS_WEB), (MEITUAN, DEAL_DETAIL)}:

@@ -15,13 +15,16 @@ python -m venv .venv
 
 ```powershell
 # 只识别当前可见任务
-powershell -NoProfile -ExecutionPolicy Bypass -File .\run.ps1
+.\.venv\Scripts\python.exe -X utf8 .\fcash.py
 
 # 按顺序执行剩余任务
-powershell -NoProfile -ExecutionPolicy Bypass -File .\run.ps1 -Execute
+.\.venv\Scripts\python.exe -X utf8 .\fcash.py --execute
+
+# USB 重连并回到游戏后，只续跑浏览好物
+.\.venv\Scripts\python.exe -X utf8 .\fcash.py --execute --task goods
 ```
 
-只有一台已授权真机时会自动选择。多台手机时加 `-Serial <序列号>`。可用 `-Python <解释器路径>` 指定已有 Python，或加 `-Task goods -Limit 1` 单独试跑一轮。
+只有一台已授权真机时会自动选择。多台手机时加 `--serial <序列号>`。可加 `--task goods --limit 1` 单独跑好物一轮。原有 `run.ps1` 也可以作为启动入口。
 
 | 顺序 | 参数 | 任务 |
 |---|---|---|
@@ -32,6 +35,14 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\run.ps1 -Execute
 | 5 | `goods` | 浏览好物 5 秒领奖励 |
 
 放置区满时，程序会回游戏首页，间隔 5.5 秒执行 10 次一键合成，再打开「每日任务」。如果停在未知页面，先查看窗口里的停止原因和运行记录，再从游戏首页或任务列表续跑。
+
+## 2026-11-22 更新
+
+- 日常执行可直接启动 `fcash.py`。同一任务的进度裁图完全一致时，复用已核验的 OCR 结果。广告返回过程中仅在页面操作或等待后刷新前台状态。
+- 查找任务时优先长滑动，并核对相邻画面仍有足够重叠。无法确认重叠时，自动用短滑动重新搜索。广告所需停留时间和最终结算核对仍按原流程执行。
+- 支持跳过首页额外红包广告，退出已确认的两层微信广告网页，并识别不同商品背景下的好物卡片关闭按钮。
+
+11 月 21 日真机日志确认前四项清零。好物在合成时遇到 USB 断开，当轮结算未确认。日志记录复用 8 次 OCR，按此前相同画面的识别耗时估算省约 3.9 秒。长滑动已通过离线验证，整套耗时待真机对照。
 
 ## 2026-11-20 更新
 
