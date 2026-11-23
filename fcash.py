@@ -31,6 +31,7 @@ MRNX = "com.meituan.android.mrnx.container.MRNXStandardActivity"
 TRAVEL_DETAIL = "com.meituan.traveltools.mrncontainer.HTMRNBaseActivity"
 DEAL_DETAIL = "com.meituan.android.generalcategories.dealdetail.GCDealDetailActivity"
 SUBGAME = GAME + "1"
+SUBGAME_INTERSTITIAL = "com.windmill.sdk.widget.InterstitialView_4012003"
 FULL_AD = MEITUAN + ".msv.page.activity.MSVPageActivity"
 AD_WEB = "com.ubix.ssp.open.comm.UBiXWebViewActivity"
 AD_SHOP = "com.qq.e.ads.ADActivity"
@@ -40,7 +41,10 @@ WECHAT_AD_WEB_VIEWS = {
 }
 CLOUD_HANDOFF = ("com.miui.cloudservice", "com.miui.cloudservice.wxapi.WXEntryActivity")
 DOUYIN_HANDOFF = ("com.ss.android.ugc.aweme", "com.ss.android.ugc.aweme.app.DeepLinkHandlerActivity")
+APP_STORE_HANDOFF = ("com.tencent.android.qqdownloader", "com.tencent.pangu.link.SplashActivity")
 APP_LOCK = ("com.miui.securitycenter", "com.miui.applicationlock.ConfirmAccessControl")
+IDENTITY_WEB = (MEITUAN, "com.sankuai.waimai.business.knb.WMMultiWebViewActivity")
+SLIDER_VERIFICATION = (MEITUAN, "com.meituan.android.yoda.activity.YodaRouterTransparentActivity")
 AD_LANDING_COMPONENTS = {
     ("com.taobao.idlefish", "com.taobao.fleamarket.home.activity.InitActivity"),
     ("com.taobao.idlefish", "com.taobao.idlefish.custom.FishUserLoginActivity"),
@@ -52,6 +56,8 @@ AD_LANDING_COMPONENTS = {
     ("com.miui.video", "com.miui.video.feature.home.VideoFlowPlayLetActivity"),
     ("com.kmxs.reader", "com.km.app.home.view.LoadingActivity"),
     ("com.kmxs.reader", "com.km.app.update.UpdateVersionV2Activity"),
+    ("com.luna.music", "com.luna.biz.main.main.SchemeActivity"),
+    ("com.luna.music", "com.luna.biz.main.main.MainActivity"),
 }
 # These apps were already verified as ad destinations in the local Meituan setup.
 AD_APPS = {
@@ -153,15 +159,7 @@ class Phone:
         self.adb = shutil.which("adb") or (str(candidate) if local and candidate.is_file() else None)
         if not self.adb:
             raise Stop("找不到 adb，请检查 Android Platform Tools。", code="adb_missing")
-        rows = command(self.adb, "devices", "-l").decode(errors="replace").splitlines()[1:]
-        entries = [fields for fields in map(str.split, rows) if len(fields) >= 2]
-        devices = [
-            fields[0] for fields in entries
-            if len(fields) > 2 and fields[1] == "device"
-            and any(field.startswith(("usb:", "transport_id:")) for field in fields[2:])
-            and not fields[0].startswith("emulator-")
-            and ":" not in fields[0] and not fields[0].endswith("._adb-tls-connect._tcp")
-        ]
+        entries, devices = self.usb_devices()
         if serial is None:
             if len(devices) != 1:
                 states = ", ".join(fields[1] for fields in entries) or "无设备"
@@ -171,6 +169,30 @@ class Phone:
         if serial not in devices:
             raise Stop("未找到指定的已授权手机。", code="adb_device_unavailable")
         self.serial = serial
+
+    def usb_devices(self, *, timeout=20):
+        rows = command(self.adb, "devices", "-l", timeout=timeout).decode(errors="replace").splitlines()[1:]
+        entries = [fields for fields in map(str.split, rows) if len(fields) >= 2]
+        devices = [
+            fields[0] for fields in entries
+            if len(fields) > 2 and fields[1] == "device"
+            and any(field.startswith(("usb:", "transport_id:")) for field in fields[2:])
+            and not fields[0].startswith("emulator-")
+            and ":" not in fields[0] and not fields[0].endswith("._adb-tls-connect._tcp")
+        ]
+        return entries, devices
+
+    def wait_for_reconnect(self, seconds=30):
+        deadline = time.monotonic() + seconds
+        while (left := deadline - time.monotonic()) > 0:
+            try:
+                _, devices = self.usb_devices(timeout=min(3, left))
+                if self.serial in devices:
+                    return True
+            except (Stop, subprocess.TimeoutExpired):
+                pass
+            time.sleep(min(1.5, max(0, deadline - time.monotonic())))
+        return False
 
     def call(self, *args, timeout=20):
         operation = args[1] if args[0] == "shell" else args[0]
@@ -251,6 +273,10 @@ class Runner:
         self.last_component = None
         self.last_heartbeat = time.monotonic()
         self.final_rewards = 0
+        self.rewards_seen = 0
+        self.wide_scan_enabled = True
+        self.rounds_confirmed = 0
+        self.claim_in_flight = False
         self.capacity_recoveries = 0
         self.blocked = False
         self.templates = {
@@ -298,11 +324,20 @@ class Runner:
             self.log("exception_traceback", traceback=traceback.format_exc())
         for label, (image, captured_at, capture_phase) in self.recent_frames.items():
             self.evidence(label, image, captured_at=captured_at, capture_phase=capture_phase)
-        self.evidence("interrupted")
+        if code != "adb_device_unavailable":
+            self.evidence("interrupted")
         self.log("diagnostics_finished")
 
     def component(self):
         component = self.phone.component()
+        if component == SLIDER_VERIFICATION:
+            self.last_component = component
+            raise Stop("当前页面需要在手机上亲自完成滑块验证。", code="verification_required")
+        if component == IDENTITY_WEB:
+            frame = self.phone.frame(diagnostic=True, timeout=3)
+            if self.match(frame, "identity_verification", (390, 92, 700, 249), 0.94):
+                self.last_component = component
+                raise Stop("当前页面需要在手机上亲自完成身份核实。", code="verification_required")
         if component[0] and component != self.last_component:
             self.last_component = component
             self.log("foreground_changed", package=component[0], activity=component[1])
@@ -364,6 +399,7 @@ class Runner:
                     is_final = later is None and final is not None
                     self.evidence("final-reward" if is_final else "reward", image)
                     self.phone.tap(later or final, activity=GAME)
+                    self.rewards_seen += 1
                     if is_final:
                         self.final_rewards += 1
                     self.log("reward_dismissed", final=is_final)
@@ -372,11 +408,9 @@ class Runner:
                     if not close:
                         raise Stop("离线收益浮层遮住任务入口，未识别跳过按钮。")
                     self.phone.tap(close)
-                elif self.match(image, "home_bonus_double", (180, 565, 872, 815)):
-                    close = self.match(image, "home_bonus_skip", (345, 1790, 750, 1925))
-                    if close:
-                        self.phone.tap(close, activity=GAME)
-                        self.log("home_bonus_skipped")
+                elif self.dismiss_home_popup(image):
+                    time.sleep(0.4)
+                    continue
                 elif self.match(image, "panel", (365, 685, 716, 834)):
                     if panel_header_visible(image):
                         return image
@@ -392,6 +426,21 @@ class Runner:
             time.sleep(0.4)
         raise Stop("未确认「领现金 → 每日任务」。", code="task_panel_unavailable")
 
+    def dismiss_home_popup(self, image):
+        if self.match(image, "home_bonus_double", (180, 565, 872, 815)):
+            close = self.match(image, "home_bonus_skip", (345, 1790, 750, 1925))
+            event = "home_bonus_skipped"
+        else:
+            offer = self.match(image, "home_order_offer", (350, 1540, 910, 1735), 0.95)
+            if not offer or np.median(crop(image, offer)[:, :, 1]) < 140:
+                return False
+            close = self.goods_card_close(image, (878, 585, 1007, 712))
+            event = "home_order_offer_closed"
+        if close:
+            self.phone.tap(close, activity=GAME)
+            self.log(event)
+        return True
+
     def merge_for_capacity(self, image):
         if self.match(image, "panel", (365, 685, 716, 834)):
             close = self.match(image, "panel_close", (950, 676, 1060, 800))
@@ -401,9 +450,15 @@ class Runner:
             time.sleep(0.7)
         print("放置区已满，按 5.5 秒间隔执行 10 次一键合成。", flush=True)
         for step in range(10):
-            if self.component() != (MEITUAN, GAME):
-                raise Stop("一键合成期间已离开领现金游戏。")
-            image = self.phone.frame()
+            for _ in range(3):
+                if self.component() != (MEITUAN, GAME):
+                    raise Stop("一键合成期间已离开领现金游戏。")
+                image = self.phone.frame()
+                if not self.dismiss_home_popup(image):
+                    break
+                time.sleep(0.65)
+            else:
+                raise Stop("浮层仍遮住合成入口。", code="capacity_popup_persistent")
             entry = self.match(image, "task_entry", (750, 2060, 905, 2260), 0.86)
             button = self.match(image, "merge", (915, 1680, 1062, 1850), 0.85)
             if not (entry and button):
@@ -435,6 +490,7 @@ class Runner:
         return None
 
     def find(self, task, image, *, wide=True):
+        wide = wide and self.wide_scan_enabled
         for down in (False, True):
             still = 0
             direction = "down" if down else "up"
@@ -466,7 +522,9 @@ class Runner:
                 self.log("task_scan_scroll", direction=direction, step=step + 1, difference=round(difference, 2),
                          stable_scrolls=still, wide=wide)
                 if wide and still == 0 and not list_frames_overlap(old, current, down):
-                    self.log("task_scan_narrow_retry", direction=direction, step=step + 1)
+                    self.wide_scan_enabled = False
+                    self.log("task_scan_narrow_retry", direction=direction, step=step + 1,
+                             wide_disabled_for_run=True)
                     return self.find(task, image, wide=False)
         self.evidence("task-scan-end", image)
         return image, None
@@ -615,6 +673,138 @@ class Runner:
             return bool(self.match(image, "travel_detail_tabs", (18, 1440, 840, 1810)))
         return activity == WEB
 
+    def capture_home_entry(self, image):
+        entry = self.match(image, "capture_entry", (200, 2065, 335, 2248), 0.90)
+        if entry is None or np.percentile(crop(image, entry)[:, :, 2], 85) < 205:
+            return None
+        x1, y1, x2, _ = entry
+        region = (x1 - 6, y1 - 170, x2 + 66, y1 - 65)
+        if self.match(image, "capture_badge", region, 0.92):
+            return entry, True
+        cx = center(entry)[0]
+        hsv = cv2.cvtColor(crop(image, (cx, region[1], region[2], region[3])), cv2.COLOR_BGR2HSV)
+        hue, saturation, brightness = cv2.split(hsv)
+        red = (((hue <= 10) | (hue >= 170)) & (saturation >= 175) & (brightness >= 205)).astype(np.uint8)
+        contours, _ = cv2.findContours(red, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for contour in contours:
+            _, _, width, height = cv2.boundingRect(contour)
+            if (10 <= width <= 46 and 10 <= height <= 46 and 0.75 <= width / height <= 1.33
+                    and cv2.contourArea(contour) >= 0.53 * width * height):
+                return entry, True
+        return entry, False
+
+    def capture_now_button(self, image):
+        region = (380, 2025, 700, 2165)
+        pixels = crop(image, region)
+        blue, green, red = cv2.split(pixels)
+        if np.mean((red > 205) & (green > 65) & (green < 195) & (blue < 110)) < 0.35:
+            return None
+        if button := self.match(image, "capture_go", (342, 1990, 745, 2215), 0.93):
+            return button
+        if re.sub(r"\s+", "", self.ocr(pixels, "capture-button.png")) == "马上捕捉":
+            return region
+        return None
+
+    def capture_cooling_down(self, image):
+        return (self.match(image, "capture_browse_only", (332, 1990, 757, 2205), 0.92)
+                and self.match(image, "capture_cooldown", (503, 2220, 804, 2320), 0.91))
+
+    def run_capture(self, execute):
+        self.task_key = "capture"
+        self.last_remaining = None
+        self.round_info = None
+        self.recent_frames.clear()
+        self.stage("capture_home")
+        if self.component() != (MEITUAN, GAME):
+            raise Stop("请回到领现金游戏主页，再执行捕捉。", code="capture_home_unconfirmed")
+        image = self.phone.frame()
+        if panel_header_visible(image) and self.match(image, "panel", (365, 685, 716, 834)):
+            if not execute:
+                raise Stop("请关闭每日任务面板，再预览捕捉入口。", code="capture_home_unconfirmed")
+            close = self.match(image, "panel_close", (950, 676, 1060, 800))
+            if close is None:
+                raise Stop("未确认每日任务面板的关闭按钮。", code="capture_home_unconfirmed")
+            self.phone.tap(close, activity=GAME)
+            self.log("capture_daily_panel_closed")
+            home = None
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and self.component() == (MEITUAN, GAME):
+                home = self.capture_home_entry(self.phone.frame())
+                if home is not None:
+                    break
+                time.sleep(0.4)
+        else:
+            home = self.capture_home_entry(image)
+        if home is None:
+            raise Stop("未确认游戏主页上的捕捉入口。", code="capture_home_unconfirmed")
+        entry, pending = home
+        self.log("capture_home_checked", pending=pending)
+        if not pending:
+            print("已检查游戏主页，捕捉入口没有红点。", flush=True)
+            return
+        if not execute:
+            print("检测到捕捉入口有红点。", flush=True)
+            return
+        x, y = center(entry)
+        self.phone.tap((x, y - 47, x, y - 47), activity=GAME)
+        self.stage("capture_button")
+        deadline = time.monotonic() + 8
+        tapped = False
+        confirmed = False
+        upgrade_closed = False
+        cooldown_after = 0.0
+        while time.monotonic() < deadline and self.component() == (MEITUAN, GAME):
+            current = self.phone.frame()
+            if (tapped and not confirmed
+                    and self.match(current, "capture_result_success", (207, 756, 586, 900), 0.95)
+                    and (button := self.match(current, "capture_result_confirm", (328, 1570, 751, 1790), 0.94))):
+                self.evidence("capture-result", current)
+                self.phone.tap(button, activity=GAME)
+                self.log("capture_result_confirmed")
+                confirmed = True
+                cooldown_after = max(cooldown_after, time.monotonic() + 3)
+                deadline = max(deadline, time.monotonic() + 6)
+                time.sleep(0.65)
+                continue
+            if (tapped and not upgrade_closed
+                    and self.match(current, "reward", (220, 390, 860, 620), 0.86)
+                    and self.match(current, "capture_upgrade_prompt", (342, 1813, 727, 1973), 0.94)
+                    and (close := self.match(current, "capture_upgrade_close", (881, 310, 1039, 451), 0.94))):
+                self.evidence("capture-upgrade-offer", current)
+                self.phone.tap(close, activity=GAME)
+                self.log("capture_upgrade_offer_closed")
+                upgrade_closed = True
+                cooldown_after = time.monotonic()
+                time.sleep(0.65)
+                continue
+            if not self.match(current, "capture_lucky_title", (365, 718, 717, 851), 0.93):
+                time.sleep(0.5)
+                continue
+            if time.monotonic() >= cooldown_after and self.capture_cooling_down(current):
+                self.evidence("capture-cooldown", current)
+                self.log("capture_cooldown_seen", free_capture_tapped=tapped)
+                if close := self.match(current, "capture_close", (933, 682, 1068, 835), 0.93):
+                    self.phone.tap(close, activity=GAME)
+                    self.log("capture_panel_closed")
+                if confirmed:
+                    print("免费捕捉成功，奖励已确认。", flush=True)
+                elif tapped:
+                    print("免费捕捉已触发，已进入冷却。", flush=True)
+                else:
+                    print("免费捕捉冷却中。", flush=True)
+                return
+            if not tapped and (button := self.capture_now_button(current)):
+                self.evidence("capture-before-tap", current)
+                self.phone.tap(button, activity=GAME)
+                self.log("capture_now_tapped", point=center(button))
+                tapped = True
+                cooldown_after = time.monotonic() + 8
+                deadline = time.monotonic() + 14
+            time.sleep(0.5)
+        if tapped:
+            raise Stop("已点击免费捕捉，未确认结果或冷却。", code="capture_result_unconfirmed")
+        raise Stop("未确认可用的免费捕捉按钮。", code="capture_button_unconfirmed")
+
     def goods_card_button(self, image):
         layouts = (
             ((108, 1190, 485, 1350), (878, 585, 1007, 712), (359, 1520, 768, 1712)),
@@ -648,6 +838,12 @@ class Runner:
                 return "ready"
             if (self.match(image, "goods_store_recommendations", (335, 700, 810, 1070), 0.92)
                 and self.match(image, "goods_store_menu", (25, 980, 320, 1370), 0.92)):
+                return "ready"
+            if (self.match(image, "goods_store_treasure_badge", (133, 703, 359, 1145), 0.94)
+                and self.match(image, "goods_store_treasure_tabs", (14, 1490, 622, 1870), 0.93)):
+                return "ready"
+            if (self.match(image, "goods_store_recommendations", (230, 1080, 820, 1380), 0.92)
+                and self.match(image, "goods_store_consultation", (520, 2180, 920, 2340), 0.94)):
                 return "ready"
         return None
 
@@ -723,15 +919,25 @@ class Runner:
                 time.sleep(1.3)
                 return self.panel()
             replay = self.match(image, "replay", (390, 1440, 690, 1590), 0.83)
-            instruction = self.match(image, "full_instruction", (90, 159, 472, 255), 0.80)
+            instruction_area = (90, 159, 472, 255)
+            instruction = (self.match(image, "full_instruction", instruction_area, 0.80)
+                           or self.match(image, "full_instruction_dim", instruction_area, 0.94))
             if self.match(image, "full_download", (416, 1315, 667, 1460), 0.90):
                 self.blocked = True
                 self.log("full_ad_download_skipped")
                 self.phone.back()
                 time.sleep(1.3)
                 return self.panel()
+            if (self.task_key == "promo" and instruction
+                    and self.match(image, "full_promo_game_title", (233, 1905, 914, 2020), 0.94)):
+                footer = self.match(image, "full_footer_click", (419, 2125, 671, 2245), 0.92)
+                if footer:
+                    self.phone.tap(footer, activity=FULL_AD)
+                    return self.browse_promo_ad_subgame()
             if instruction and self.match(image, "full_banner", (111, 1710, 974, 1850), 0.85):
-                footer = self.match(image, "full_footer_open", (419, 2125, 671, 2245), 0.88)
+                footer_area = (419, 2125, 671, 2245)
+                footer = (self.match(image, "full_footer_open", footer_area, 0.88)
+                          or self.match(image, "full_footer_click", footer_area, 0.92))
                 if footer:
                     self.phone.tap(footer, activity=FULL_AD)
                     return self.browse_landing(10, from_full=True)
@@ -762,6 +968,45 @@ class Runner:
             button_missing_since = None
             time.sleep(0.8)
         raise Stop("未确认全屏广告已播放结束。", code="full_ad_unconfirmed")
+
+    def browse_promo_ad_subgame(self):
+        self.stage("promo_ad_subgame")
+        deadline = time.monotonic() + 8
+        subgame = (MEITUAN, SUBGAME)
+        interstitial = (MEITUAN, SUBGAME_INTERSTITIAL)
+        while self.component() not in {subgame, interstitial}:
+            if time.monotonic() >= deadline:
+                raise Stop("未确认优惠活动广告的小游戏落地页。", code="promo_subgame_unrecognized")
+            time.sleep(0.45)
+        self.log("promo_ad_subgame_opened")
+        time.sleep(12)
+        return self.finish_promo_ad_subgame()
+
+    def finish_promo_ad_subgame(self):
+        deadline = time.monotonic() + 18
+        while time.monotonic() < deadline:
+            package, activity = self.component()
+            if (package, activity) == (MEITUAN, FULL_AD):
+                return self.finish_ad_return(True)
+            if package != MEITUAN or activity not in {SUBGAME, SUBGAME_INTERSTITIAL}:
+                break
+            image = self.phone.frame()
+            if activity == SUBGAME_INTERSTITIAL:
+                close = self.match(image, "subgame_interstitial_close", (745, 451, 918, 579), 0.93)
+            else:
+                close = self.match(image, "subgame_exit", (920, 36, 1045, 165), 0.86)
+            if close:
+                try:
+                    self.phone.tap(close, activity=activity)
+                except Stop as exc:
+                    if exc.code != "foreground_changed_before_tap":
+                        raise
+                else:
+                    self.log("promo_ad_page_closed", activity=activity)
+                    time.sleep(1.1)
+                    continue
+            time.sleep(0.45)
+        raise Stop("未确认关闭优惠活动小游戏并返回原广告。", code="promo_full_ad_return_unconfirmed")
 
     def full_ad_done(self, image):
         region = (95, 156, 485, 254)
@@ -872,7 +1117,8 @@ class Runner:
                 time.sleep(1.3)
                 return self.finish_ad_return(from_full)
             # These transitions do not start the dwell timer.
-            handoff = (package, activity) == DOUYIN_HANDOFF or (from_full and (package, activity) == CLOUD_HANDOFF)
+            handoff = ((package, activity) in {DOUYIN_HANDOFF, APP_STORE_HANDOFF}
+                       or (from_full and (package, activity) == CLOUD_HANDOFF))
             if package not in (None, MEITUAN) and not handoff:
                 raise Stop(f"广告跳转到尚未验证的应用 {package}。", code="landing_app_unrecognized")
             time.sleep(0.5)
@@ -881,9 +1127,14 @@ class Runner:
     def return_from_app_lock(self, seconds=0, *, from_full=False):
         self.log("app_lock_return")
         self.blocked = True
-        self.phone.return_to_game()
-        time.sleep(1.3)
+        if self.phone.component() == APP_LOCK:
+            self.phone.back()
+            time.sleep(0.8)
         package, activity = self.component()
+        if (package, activity) == APP_LOCK:
+            self.phone.return_to_game()
+            time.sleep(1.3)
+            package, activity = self.component()
         if is_ad_landing((package, activity)):
             self.log("app_lock_landing", package=package, activity=activity)
             if seconds:
@@ -998,17 +1249,16 @@ class Runner:
         deadline = time.monotonic() + 10
         after = None
         claimed = False
+        claim_rewards_before = None
         while True:
             self.remember("last-settlement-check", image)
             row = self.row(image, task)
             if row:
-                if not claimed:
-                    reward_result = self.collect_ready(image, task, row)
-                    if reward_result is not None:
-                        claimed = True
-                        image = reward_result
-                        continue
                 try:
+                    if not claimed and (reward_result := self.collect_ready(image, task, row)) is not None:
+                        claimed = True
+                        image, claim_rewards_before = reward_result
+                        continue
                     after = self.remaining(image, task, row[0])
                 except DifferentTotal:
                     row = None
@@ -1022,7 +1272,8 @@ class Runner:
                 if row and after != left:
                     return image, row, after
             final_seen = left == 1 and self.final_rewards > final_before
-            if time.monotonic() >= deadline or (not row and final_seen):
+            claim_reward_seen = claim_rewards_before is not None and self.rewards_seen > claim_rewards_before
+            if time.monotonic() >= deadline or (not row and (final_seen or claim_reward_seen)):
                 if row:
                     return image, row, after
                 image, row = self.find(task, image)
@@ -1030,18 +1281,24 @@ class Runner:
                     return image, row, self.remaining(image, task, row[0])
                 if left == 1 and self.final_rewards > final_before:
                     return image, None, 0
+                if claim_rewards_before is not None and self.rewards_seen > claim_rewards_before:
+                    raise Stop("已看到任务领取后的奖励弹窗，重扫后未找到任务行。",
+                               code="claim_reward_without_progress")
                 raise Stop(f"浏览后未找到「{task.name}」，无法核对结算。", code="settlement_target_missing")
             time.sleep(0.55)
             image = self.panel()
 
     def claim_ready(self, image, task, row):
-        if task.key != "goods" or row[1]:
+        if task.key not in {"goods", "promo"} or row[1]:
             return False
         y = row[0][1]
         button = self.match(image, "claim", (805, max(LIST[1], y - 24), 1006, min(2380, y + 115)))
         if not button:
             return False
+        if task.total is not None:
+            self.remaining(image, task, row[0])
         self.remember("before-task-claim", image)
+        self.claim_in_flight = True
         self.log("task_claim_intent", point=center(button))
         self.phone.tap(button, activity=GAME)
         self.log("task_claim", task=task.key)
@@ -1050,23 +1307,66 @@ class Runner:
 
     def collect_ready(self, image, task, row):
         capacity_before = self.capacity_recoveries
+        rewards_before = self.rewards_seen
         if not self.claim_ready(image, task, row):
             return None
         image = self.panel()
         if self.capacity_recoveries > capacity_before:
             image, row = self.find(task, image)
+            rewards_before = self.rewards_seen
             if row and self.claim_ready(image, task, row):
                 image = self.panel()
-        return image
+            else:
+                rewards_before = None
+        self.claim_in_flight = False
+        return image, rewards_before
 
-    def finish(self, task, limit, *, resume_final_before=None):
+    def run_daily_task(self, task, limit, *, resume_final_before=None):
+        self.rounds_confirmed = 0
+        resume_progress = None
+        reconnect_attempted = False
+        while True:
+            try:
+                self.finish(task, limit, resume_final_before=resume_final_before, resume_progress=resume_progress)
+                return True
+            except Stop as exc:
+                if exc.code == "claim_reward_without_progress":
+                    self.log("task_reward_claimed_unverified", reason=str(exc), last_remaining=self.last_remaining)
+                    print(f"{task.name}：已领奖，任务行已消失，未确认次数清零。", flush=True)
+                    return False
+                if exc.code != "adb_device_unavailable" or reconnect_attempted:
+                    raise
+                reconnect_attempted = True
+                tap_pending = bool(self.round_info and "point" in self.round_info
+                                   and "remaining_observed" not in self.round_info)
+                action_pending = self.claim_in_flight or tap_pending
+                resume_progress = self.last_remaining, action_pending
+                self.log("device_reconnect_wait", seconds=30, last_remaining=self.last_remaining,
+                         action_pending=action_pending)
+                print("USB 已断开，等待原设备重新连接（最多 30 秒）。", flush=True)
+                if not self.phone.wait_for_reconnect():
+                    self.log("device_reconnect_timeout")
+                    raise
+                self.progress_cache = None
+                self.last_component = None
+                component = self.component()
+                if component != (MEITUAN, GAME):
+                    raise Stop("USB 已恢复，请先回到领现金游戏，再核对当前任务。",
+                               code="reconnect_foreground_unconfirmed")
+                self.log("device_reconnected")
+
+    def finish(self, task, limit, *, resume_final_before=None, resume_progress=None):
         self.task_key = task.key
         self.last_remaining = None
         self.round_info = None
+        self.claim_in_flight = False
         self.recent_frames.clear()
         self.stage("locate_task")
         image, row = self.find(task, self.panel())
         if row is None:
+            if (resume_progress and (resume_progress[0] is not None or resume_progress[1])):
+                self.last_remaining = resume_progress[0]
+                raise Stop("重连后未找到中断的任务行，请核对结算。", code="reconnect_task_unconfirmed")
             if resume_final_before is not None and self.final_rewards > resume_final_before:
                 self.last_remaining = 0
                 self.log("task_finished", task=task.key, remaining=0)
@@ -1075,23 +1375,38 @@ class Runner:
             self.log("task_not_listed", task=task.key)
             print(f"当前列表未显示「{task.name}」，跳过。", flush=True)
             return
+        left = self.remaining(image, task, row[0])
+        if resume_progress is not None:
+            previous, action_pending = resume_progress
+            if previous is not None and (left > previous or (action_pending and left == previous)):
+                self.last_remaining = left
+                raise Stop("重连后的进度未能确认中断操作，请核对任务界面。",
+                           code="reconnect_progress_unconfirmed")
+            if previous is not None:
+                self.rounds_confirmed += previous - left
+            self.log("task_progress_reread_after_reconnect", previous_remaining=previous, remaining=left)
+        self.last_remaining = left
         final_before = self.final_rewards
-        claimed_image = self.collect_ready(image, task, row)
-        if claimed_image is not None:
+        claim_result = self.collect_ready(image, task, row)
+        if claim_result is not None:
+            claimed_image, claim_rewards_before = claim_result
             image, row = self.find(task, claimed_image)
             if row is None:
-                if self.final_rewards > final_before:
+                if left <= 1 and self.final_rewards > final_before:
                     self.last_remaining = 0
                     self.log("task_finished", task=task.key, remaining=0)
                     print(f"{task.name}：最终奖励已结算。", flush=True)
                     return
-                raise Stop("领取好物奖励后未确认任务状态。", code="claim_state_unconfirmed")
-        left = self.remaining(image, task, row[0])
-        self.last_remaining = left
+                if claim_rewards_before is not None and self.rewards_seen > claim_rewards_before:
+                    raise Stop("已看到任务领取后的奖励弹窗，重扫后未找到任务行。",
+                               code="claim_reward_without_progress")
+                raise Stop(f"领取「{task.name}」奖励后未确认任务状态。", code="claim_state_unconfirmed")
+            left = self.remaining(image, task, row[0])
+            self.last_remaining = left
         print(f"{task.name}：剩余 {left} 次。", flush=True)
         self.log("task_started", task=task.key, remaining=left)
         self.evidence("task-start", image)
-        rounds = min(left, limit) if limit else left
+        rounds = min(left, max(0, limit - self.rounds_confirmed)) if limit else left
         retries = 0
         while rounds > 0:
             self.recent_frames.clear()
@@ -1147,6 +1462,7 @@ class Runner:
             if after != left - 1:
                 raise Stop(f"「{task.name}」剩余次数未按预期变化（{left} → {after}）。", code="settlement_progress_mismatch")
             self.last_remaining = after
+            self.rounds_confirmed += 1
             self.log("round_confirmed", task=task.key, remaining=after)
             self.evidence("round-confirmed", image)
             print(f"{task.name}：本轮已结算，剩余 {after} 次。", flush=True)
@@ -1159,14 +1475,17 @@ class Runner:
 def main():
     parser = argparse.ArgumentParser(description="领现金 · 每日任务浏览助手")
     parser.add_argument("--serial", help="已授权 USB 真机的 ADB 序列号")
-    parser.add_argument("--task", choices=("all", *(task.key for task in TASKS)), default="all")
-    parser.add_argument("--limit", type=int, default=0, help="每项最多执行的轮数，0 表示完成剩余轮数")
+    parser.add_argument("--task", choices=("all", *(task.key for task in TASKS), "capture"), default="all",
+                        help="capture 为主页捕捉")
+    parser.add_argument("--limit", type=int, default=0, help="日常任务每项最多执行的轮数，0 表示不限")
     parser.add_argument("--execute", action="store_true")
     parser.add_argument("--resume-ad", action="store_true", help="继续当前已确认归属的全屏广告")
     parser.add_argument("--recover-landing", action="store_true", help="从本程序打开的已知广告落地页返回")
     args = parser.parse_args()
     if not 0 <= args.limit <= 30:
         parser.error("--limit must be between 0 and 30")
+    if args.task == "capture" and (args.resume_ad or args.recover_landing):
+        parser.error("capture uses its own start or preview")
     if args.resume_ad and (not args.execute or args.task == "all"):
         parser.error("--resume-ad requires --execute and a specific --task")
     if args.recover_landing and (not args.execute or args.resume_ad):
@@ -1182,6 +1501,10 @@ def main():
             runner.stage("connect")
             runner.phone = Phone(args.serial)
             runner.log("device_connected")
+            if args.task == "capture":
+                runner.run_capture(args.execute)
+                runner.log("run_finished", status="finished" if args.execute else "preview")
+                return 0
             tasks = [task for task in TASKS if args.task in {"all", task.key}]
             resume_final_before = (
                 runner.final_rewards if args.task != "all" and (args.resume_ad or args.recover_landing) else None
@@ -1221,8 +1544,24 @@ def main():
                         print(f"{task.name}：识别到行，剩余 {runner.remaining(image, task, row[0])} 次。")
                 runner.log("run_finished", status="preview")
                 return 0
+            unverified_tasks = []
             for task in tasks:
-                runner.finish(task, args.limit, resume_final_before=resume_final_before)
+                if not runner.run_daily_task(task, args.limit, resume_final_before=resume_final_before):
+                    unverified_tasks.append(task.key)
+            if args.task == "all":
+                try:
+                    runner.run_capture(True)
+                except Stop as exc:
+                    if not (exc.code or "").startswith("capture_"):
+                        raise
+                    runner.log("capture_deferred", reason=str(exc), code=exc.code)
+                    print(f"捕捉待核对：{exc}", flush=True)
+                    unverified_tasks.append("capture")
+                runner.task_key = None
+            if unverified_tasks:
+                runner.log("run_finished", status="partial", unverified_tasks=unverified_tasks)
+                print(f"本批部分完成，待核对：{', '.join(unverified_tasks)}。", flush=True)
+                return 2
             runner.log("run_finished", status="finished")
         return 0
     except KeyboardInterrupt as exc:

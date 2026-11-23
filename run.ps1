@@ -1,6 +1,6 @@
 param(
     [switch]$Execute,
-    [ValidateSet('all', 'page', 'browse12', 'promo', 'browse14', 'goods')][string]$Task = 'all',
+    [ValidateSet('all', 'page', 'browse12', 'promo', 'browse14', 'goods', 'capture')][string]$Task = 'all',
     [ValidateRange(0, 30)][int]$Limit = 0,
     [string]$Serial,
     [string]$Python
