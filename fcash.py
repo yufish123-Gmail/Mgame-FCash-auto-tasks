@@ -31,6 +31,7 @@ MRNX = "com.meituan.android.mrnx.container.MRNXStandardActivity"
 TRAVEL_DETAIL = "com.meituan.traveltools.mrncontainer.HTMRNBaseActivity"
 DEAL_DETAIL = "com.meituan.android.generalcategories.dealdetail.GCDealDetailActivity"
 SUBGAME = GAME + "1"
+PROMO_LONG_SUBGAME = GAME + "2"
 SUBGAME_INTERSTITIAL = "com.windmill.sdk.widget.InterstitialView_4012003"
 FULL_AD = MEITUAN + ".msv.page.activity.MSVPageActivity"
 AD_WEB = "com.ubix.ssp.open.comm.UBiXWebViewActivity"
@@ -42,6 +43,7 @@ WECHAT_AD_WEB_VIEWS = {
 CLOUD_HANDOFF = ("com.miui.cloudservice", "com.miui.cloudservice.wxapi.WXEntryActivity")
 DOUYIN_HANDOFF = ("com.ss.android.ugc.aweme", "com.ss.android.ugc.aweme.app.DeepLinkHandlerActivity")
 APP_STORE_HANDOFF = ("com.tencent.android.qqdownloader", "com.tencent.pangu.link.SplashActivity")
+TOMATO_AUDIO_HANDOFF = ("com.xs.fm", "com.dragon.read.push.AppSdkActivity")
 APP_LOCK = ("com.miui.securitycenter", "com.miui.applicationlock.ConfirmAccessControl")
 IDENTITY_WEB = (MEITUAN, "com.sankuai.waimai.business.knb.WMMultiWebViewActivity")
 SLIDER_VERIFICATION = (MEITUAN, "com.meituan.android.yoda.activity.YodaRouterTransparentActivity")
@@ -58,6 +60,7 @@ AD_LANDING_COMPONENTS = {
     ("com.kmxs.reader", "com.km.app.update.UpdateVersionV2Activity"),
     ("com.luna.music", "com.luna.biz.main.main.SchemeActivity"),
     ("com.luna.music", "com.luna.biz.main.main.MainActivity"),
+    ("com.xs.fm", "com.dragon.read.pages.main.MainFragmentActivity"),
 }
 # These apps were already verified as ad destinations in the local Meituan setup.
 AD_APPS = {
@@ -341,7 +344,6 @@ class Runner:
         if component[0] and component != self.last_component:
             self.last_component = component
             self.log("foreground_changed", package=component[0], activity=component[1])
-            self.evidence("foreground")
         now = time.monotonic()
         if now - self.last_heartbeat >= 8:
             self.log("heartbeat", package=component[0], activity=component[1])
@@ -375,8 +377,17 @@ class Runner:
         next_open = 0.0
         open_attempts = 0
         merge_batches = 0
-        while time.monotonic() < deadline:
-            if self.component() == (MEITUAN, GAME):
+        grace_used = False
+        while True:
+            component = self.component()
+            now = time.monotonic()
+            if now >= deadline:
+                if grace_used or not open_attempts or component != (MEITUAN, GAME):
+                    break
+                grace_used = True
+                deadline = now + 5
+                self.log("task_panel_open_grace", seconds=5, open_attempts=open_attempts)
+            if component == (MEITUAN, GAME):
                 image = self.phone.frame()
                 self.remember("last-panel-check", image)
                 if self.match(image, "capacity", (170, 1120, 919, 1270), 0.87):
@@ -387,6 +398,7 @@ class Runner:
                     merge_batches += 1
                     next_open = 0.0
                     open_attempts = 0
+                    grace_used = False
                     deadline = time.monotonic() + 20
                     continue
                 # During the entrance animation the title can be dim while the buttons are readable.
@@ -414,7 +426,7 @@ class Runner:
                 elif self.match(image, "panel", (365, 685, 716, 834)):
                     if panel_header_visible(image):
                         return image
-                elif open_attempts < 3 and time.monotonic() >= next_open:
+                elif not grace_used and open_attempts < 3 and time.monotonic() >= next_open:
                     entry = self.match(image, "task_entry", (750, 2060, 905, 2260), 0.86)
                     if entry:
                         x = center(entry)[0]
@@ -613,6 +625,11 @@ class Runner:
                 if probes == 1:
                     self.remember("after-task-tap-first", image)
                 self.remember("after-task-tap-latest", image)
+                if (task.key == "promo" and activity == PROMO_LONG_SUBGAME
+                        and self.match(image, "promo_long_subgame_title", (155, 281, 680, 532), 0.94)):
+                    self.blocked = True
+                    self.log("promo_long_subgame_exit")
+                    return self.leave_subgame(activity)
                 if task.key == "goods" and self.goods_card_button(image):
                     self.evidence("goods-card", image)
                     return self.browse_goods_card(image)
@@ -830,6 +847,12 @@ class Runner:
             if (self.match(image, "goods_deal_details", (18, 850, 320, 1800), 0.90)
                 and self.match(image, "goods_deal_cart", (355, 2188, 681, 2335), 0.90)):
                 return "ready"
+            if (self.match(image, "goods_limited_offer", (365, 309, 778, 488), 0.92)
+                and self.match(image, "goods_more_offers", (333, 2170, 721, 2330), 0.94)):
+                return "ready"
+            if (self.match(image, "goods_purchase_terms", (20, 1260, 310, 1570), 0.94)
+                and self.match(image, "goods_bottom_cart", (352, 2205, 676, 2342), 0.92)):
+                return "ready"
         if activity == MRN_STANDARD:
             image = self.phone.frame()
             if (self.match(image, "goods_store_tabs", (18, 1150, 760, 2050), 0.90)
@@ -992,7 +1015,9 @@ class Runner:
                 break
             image = self.phone.frame()
             if activity == SUBGAME_INTERSTITIAL:
-                close = self.match(image, "subgame_interstitial_close", (745, 451, 918, 579), 0.93)
+                region = (745, 451, 918, 579)
+                close = (self.match(image, "subgame_interstitial_close", region, 0.93)
+                         or self.match(image, "subgame_interstitial_close_blue", region, 0.95))
             else:
                 close = self.match(image, "subgame_exit", (920, 36, 1045, 165), 0.86)
             if close:
@@ -1025,12 +1050,12 @@ class Runner:
         self.log("download_modal_closed")
         return True
 
-    def leave_subgame(self):
+    def leave_subgame(self, activity=SUBGAME):
         for _ in range(3):
             component = self.component()
             if component == (MEITUAN, GAME):
                 return self.panel()
-            if component != (MEITUAN, SUBGAME):
+            if component != (MEITUAN, activity):
                 break
             image = self.phone.frame(allow_landscape=True)
             width = image.shape[1]
@@ -1038,7 +1063,7 @@ class Runner:
                 button = self.match(image, "subgame_exit", (width - 160, 36, width - 35, 165), 0.86)
                 if not button:
                     break
-                self.phone.tap(button)
+                self.phone.tap(button, activity=activity)
                 time.sleep(1.1)
                 continue
             if self.match(image, "update_prompt", (400, 1002, 685, 1162)):
@@ -1047,10 +1072,10 @@ class Runner:
                 button = self.match(image, "subgame_exit", (920, 36, 1045, 165), 0.86)
             if not button:
                 break
-            self.phone.tap(button)
+            self.phone.tap(button, activity=activity)
             time.sleep(1.1)
         component = self.component()
-        if component == (MEITUAN, SUBGAME):
+        if component == (MEITUAN, activity):
             self.blocked = True
             self.phone.return_to_game(main=True)
             self.log("subgame_return_to_main")
@@ -1064,21 +1089,33 @@ class Runner:
 
     def reopen_game(self):
         deadline = time.monotonic() + 10
+        checked_my_tab = False
         while time.monotonic() < deadline:
-            if self.component() == MAIN_COMPONENT:
-                image = self.phone.frame()
-                for name, region in (
-                    ("profile_game", (280, 1750, 558, 2010)),
-                    ("home_game", (229, 1195, 436, 1290)),
-                ):
-                    entry = self.match(image, name, region)
-                    if entry:
-                        x, y = center(entry)
-                        self.phone.tap((x, y - 60, x, y - 60))
-                        self.log("subgame_reopen", entry=name)
-                        return
+            component = self.component()
+            if component == (MEITUAN, GAME):
+                return
+            if component != MAIN_COMPONENT:
+                break
+            image = self.phone.frame()
+            for name, region, offset in (
+                ("profile_game", (280, 1750, 558, 2010), 60),
+                ("home_game", (229, 1195, 436, 1290), 60),
+                ("profile_daily_cash", (245, 1590, 595, 2120), 80),
+                ("home_daily_cash", (208, 905, 462, 1150), 66),
+            ):
+                if entry := self.match(image, name, region):
+                    x, y = center(entry)
+                    self.phone.tap((x, y - offset, x, y - offset), activity=MAIN_COMPONENT[1])
+                    self.log("subgame_reopen", entry=name)
+                    return
+            if not checked_my_tab:
+                my_tab = self.match(image, "main_my_tab", (910, 2215, 1048, 2370), 0.94)
+                if my_tab:
+                    self.phone.tap(my_tab, activity=MAIN_COMPONENT[1])
+                    checked_my_tab = True
+                    self.log("subgame_reopen_my_tab")
             time.sleep(0.5)
-        raise Stop("退出子游戏后未在美团首页或「我的」找到领现金入口。")
+        raise Stop("退出子游戏后未在美团首页或「我的」找到领现金入口。", code="subgame_reopen_unconfirmed")
 
     def browse_landing(self, seconds, *, from_full=False):
         self.stage("open_landing")
@@ -1117,7 +1154,7 @@ class Runner:
                 time.sleep(1.3)
                 return self.finish_ad_return(from_full)
             # These transitions do not start the dwell timer.
-            handoff = ((package, activity) in {DOUYIN_HANDOFF, APP_STORE_HANDOFF}
+            handoff = ((package, activity) in {DOUYIN_HANDOFF, APP_STORE_HANDOFF, TOMATO_AUDIO_HANDOFF}
                        or (from_full and (package, activity) == CLOUD_HANDOFF))
             if package not in (None, MEITUAN) and not handoff:
                 raise Stop(f"广告跳转到尚未验证的应用 {package}。", code="landing_app_unrecognized")
